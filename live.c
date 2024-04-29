@@ -127,8 +127,6 @@ static void elfread(lib_t * lib) {
 
 
 static void relink_got(lib_t * lib) {
-	// TODO: Bei RELRO: ggf GOT via mprotect schreibbar machen
-
 	// Alle GOT Einträge durchgehen
 	for (uintptr_t offset = 0; offset < lib->gotsz; offset += 8) {
 		uintptr_t * entry = (uintptr_t *)(lib->addr + lib->got + offset);
