@@ -19,8 +19,18 @@
 
 
 #define LOG(FMT,...) fprintf(stderr, "\e[33m[live.so] " FMT "\e[0m", __VA_ARGS__)
+#define ERR(FMT,...) fprintf(stderr, "\e[31m[live.so] " FMT "\e[0m", __VA_ARGS__)
 #define COUNT(x) (sizeof(x)/sizeof(x[0]))
 #define MAX_LIBS 100
+
+struct SharedMem;
+typedef struct SharedMem {
+	int fd;
+	int flags;
+	ElfW(Addr) addr;
+	size_t size;
+	size_t align;
+} sharedmem_t;
 
 struct Lib;
 typedef struct Lib {
@@ -29,6 +39,9 @@ typedef struct Lib {
 	ElfW(Addr) addr;
 	uintptr_t got;
 	size_t gotsz;
+	struct SharedMem * sharedmem;
+	size_t sharedmemsz;
+	struct Lib * first;
 	struct Lib * update;
 } lib_t;
 
@@ -67,7 +80,76 @@ static bool dlload(const char * path, lib_t * lib) {
 	return true;
 }
 
+static bool mapsharedmem(lib_t * lib, sharedmem_t * s) {
+	size_t offset = s->addr % s->align;
+	uintptr_t mem_page_addr = s->addr + lib->addr - offset;
+	size_t mem_page_size = s->size + offset;
+
+	if (lib->first == lib) {
+		const char * filename = strrchr(lib->path, '/');
+		if (filename == NULL)
+			filename = lib->path;
+		else
+			filename++;
+
+		char fdname[PATH_MAX];
+		snprintf(fdname, PATH_MAX, "%s#%p", filename, (void*)(s->addr));
+
+		if ((s->fd = memfd_create(fdname, MFD_CLOEXEC | MFD_ALLOW_SEALING)) == -1) {
+			ERR("Creating memory fd for %p of %s failed: %s\n", (void*)(s->addr), lib->path, strerror(errno));
+			close(s->fd);
+			s->fd = -1;
+			return false;
+		}
+		for (size_t written = 0; written < mem_page_size;) {
+			ssize_t w = write(s->fd, (void*)(mem_page_addr + written), mem_page_size - written);
+			if (w == -1) {
+				ERR("Writing memory %zu bytes from %p for %p of %s failed: %s\n", mem_page_size - written, (void*)(mem_page_addr + written), (void*)(s->addr), lib->path, strerror(errno));
+				close(s->fd);
+				s->fd = -1;
+				return false;
+			} else {
+				written += w;
+			}
+		}
+		if (fcntl(s->fd, F_ADD_SEALS, F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL) == -1) {
+			LOG("Sealing memory fd for %p of %s failed: %s\n", (void*)(s->addr), lib->path, strerror(errno));
+			// continue
+		}
+		if (mmap((void*)mem_page_addr, mem_page_size, s->flags, MAP_SHARED | MAP_FIXED, s->fd, 0) == MAP_FAILED) {
+			ERR("Unable to create shared memory %d at %p (%zu bytes) in %s: %s\n", s->fd, (void*)(s->addr), s->size, lib->path, strerror(errno));
+			close(s->fd);
+			s->fd = -1;
+			return false;
+		} else {
+			LOG("Created shared memory %d at %p (%zu bytes) in %s\n", s->fd, (void*)(s->addr), s->size, lib->path);
+			return true;
+		}
+	} else {
+		for (size_t j = 0; j < lib->first->sharedmemsz; j++) {
+			sharedmem_t * f = lib->first->sharedmem + j;
+			if (s->addr == f->addr && s->size == f->size) {
+				if (f->fd < 0) {
+					ERR("Not a valid shared memory for %p (%zu bytes) in %s\n", (void*)(s->addr), s->size, lib->path);
+					return false;
+				} else if (mmap((void*)mem_page_addr, mem_page_size, s->flags, MAP_SHARED | MAP_FIXED, f->fd, 0) == MAP_FAILED) {
+					ERR("Unable to map shared memory %d at %p (%zu bytes) in %s: %s\n", f->fd, (void*)(s->addr), s->size, lib->path, strerror(errno));
+					return false;
+				} else {
+					LOG("Mapped shared memory %d at %p (%zu bytes) in %s\n", f->fd, (void*)(s->addr), s->size, lib->path);
+					return true;
+				}
+			}
+		}
+		ERR("No shared memory exists for %p (%zu bytes) in %s\n", (void*)(s->addr), s->size, lib->path);
+		return false;
+	}
+}
+
 static void elfread(lib_t * lib) {
+	assert(lib != NULL);
+	assert(lib->first != NULL);
+
 	bool success = true;
 	int fd = open(lib->path, O_RDONLY);
 	if (fd == -1) {
@@ -79,15 +161,63 @@ static void elfread(lib_t * lib) {
 		LOG("Cannot read ELF data of %s: %s\n", lib->path, elf_errmsg(0));
 	} else {
 		GElf_Ehdr ehdr_mem;
-		GElf_Ehdr *ehdr = gelf_getehdr (elf, &ehdr_mem);
+		GElf_Ehdr *ehdr = gelf_getehdr(elf, &ehdr_mem);
 		if (ehdr == NULL) {
 			LOG("Cannot read ELF object file header of %s: %s\n", lib->path, elf_errmsg(0));
 			success = false;
+		} else if (ehdr->e_type != ET_EXEC && ehdr->e_type != ET_DYN) {
+			LOG("Unsupported ELF type in %s\n", lib->path);
+			success = false;
 		} else {
-			// TODO - falls update:
-			// Program header table durchgehen und memory alias für data erstellen
-			// GOT auf 0 setzen
+			GElf_Phdr phdr_mem;
+			size_t phdr_num;
+			if (elf_getphdrnum(elf, &phdr_num) == -1) {
+				LOG("Cannot read ELF object program header number of %s: %s\n", lib->path, elf_errmsg(0));
+				success = false;
+			} else {
+				sharedmem_t shmem[phdr_num];
+				size_t shmem_num = 0;
+				size_t addr_delta = ehdr->e_type == ET_EXEC ? lib->addr : 0;
+				for (size_t p = 0; p < phdr_num; p++) {
+					GElf_Phdr * phdr = gelf_getphdr(elf, p, &phdr_mem);
+					if (phdr == NULL) {
+						LOG("Cannot read ELF program header #%zu of %s: %s\n", p, lib->path, elf_errmsg(0));
+						success = false;
+						break;
+					} else if (phdr->p_type == PT_GNU_RELRO) {
+						// Ignore Relro section
+						for (size_t i = 0; i < shmem_num; i++) {
+							if (shmem[i].addr == phdr->p_vaddr - addr_delta) {
+								shmem[i].addr += phdr->p_memsz;
+								shmem[i].size -= phdr->p_memsz;
+								break;
+							}
+						}
+					} else if (phdr->p_type == PT_LOAD && (phdr->p_flags & PF_W) != 0) {
+						shmem[shmem_num++] = (sharedmem_t) {
+							.fd = -1,
+							.flags = ((phdr->p_flags & PF_R) ? PROT_READ : 0) | ((phdr->p_flags & PF_W) ? PROT_WRITE : 0) | ((phdr->p_flags & PF_X) ? PROT_EXEC : 0),
+							.addr = phdr->p_vaddr - addr_delta,
+							.size = phdr->p_memsz,
+							.align = phdr->p_align
+						};
+					}
+				}
+				for (size_t i = 0; i < shmem_num; i++) {
+					if (!mapsharedmem(lib, shmem + i))
+						success = false;
+				}
+				if (lib->first == lib && shmem_num > 0) {
+					if ((lib->sharedmem = malloc(sizeof(sharedmem_t) * shmem_num)) == NULL) {
+						ERR("Unable to allocate memory for %zu shared memory entries\n", shmem_num);
+						exit(EXIT_FAILURE);
+					}
+					memcpy(lib->sharedmem, shmem, sizeof(sharedmem_t) * shmem_num);
+					lib->sharedmemsz = shmem_num;
+				}
+			}
 
+			// GOT auf 0 setzen
 			Elf_Scn * scn = NULL;
 			while ((scn = elf_nextscn(elf, scn)) != NULL) {
 				GElf_Shdr shdr_mem;
@@ -166,6 +296,8 @@ static lib_t * load_update(const char * new_path, lib_t * old) {
 		// Set address and name
 		l->addr = ((struct link_map *)(l->handle))->l_addr;  // hack
 		strncpy(l->path, new_path, PATH_MAX);
+		// copy base
+		l->first = old->first;
 		// mark update
 		old->update = l;
 
@@ -215,8 +347,34 @@ void *thread_watch(void *arg) {
 	return NULL;
 }
 
+static void thread_watcher_install() {
+	int e = pthread_create(&thread_watcher, NULL, thread_watch, NULL);
+	if (e != 0) {
+		ERR("Creating thread failed: %s\n", strerror(e));
+		exit(EXIT_FAILURE);
+	}
+	pthread_detach(thread_watcher);
+}
+
+static void fork_prepare(void) {
+	// TODO: Duplicate all shared memory
+}
+
+static void fork_parent(void) {
+	// TODO: Close duplicates
+}
+
+static void fork_child(void) {
+	// TODO: Replace originals with duplicates
+	// Start watcher thread
+	thread_watcher_install();
+}
 
 static __attribute__((constructor)) bool init() {
+	pagesize = sysconf(_SC_PAGE_SIZE);
+	if (pagesize == -1)
+		LOG("Unable to get page size: %s\n", strerror(errno));
+
 	// Load main program
 	if (!dlload(NULL, lib + 0))
 		return false;
@@ -236,11 +394,13 @@ static __attribute__((constructor)) bool init() {
 				return false;
 			}
 			lib[0].addr = l->l_addr;
+			lib[0].first = lib;
 		} else if (ignore_lib(l->l_name)) {
 			LOG("Skipping %s\n", l->l_name);
 		} else if (dlload(l->l_name, lib + libs)) {
 			strncpy(lib[libs].path, l->l_name, PATH_MAX);
 			lib[libs].addr = l->l_addr;
+			lib[libs].first = lib + libs;
 			libs++;
 			assert(libs < MAX_LIBS);
 		}
@@ -258,9 +418,11 @@ static __attribute__((constructor)) bool init() {
 
 	// TODO: Install inotify watch
 
-	pagesize = sysconf(_SC_PAGE_SIZE);
-	if (pagesize == -1)
-		LOG("Unable to get page size: %s\n", strerror(errno));
+	// TODO: int 
+	if ((errno = pthread_atfork(fork_prepare, fork_parent, fork_child)) != 0) {
+		ERR("Unable to install fork handler: %s\n", strerror(errno));
+		exit(EXIT_FAILURE);
+	}
 
 	// Read (relative) GOT address and size via ELF for each lib
 	elf_version(EV_CURRENT);
@@ -268,11 +430,6 @@ static __attribute__((constructor)) bool init() {
 		elfread(lib + l);
 
 	// install watcher thread
-	int e = pthread_create(&thread_watcher, NULL, thread_watch, NULL);
-	if (e != 0) {
-		LOG("Creating thread failed: %s\n", strerror(e));
-		exit(EXIT_FAILURE);
-	}
-	pthread_detach(thread_watcher);
+	thread_watcher_install();
 }
 
