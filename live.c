@@ -1,3 +1,7 @@
+// live.so - dynamic updating shared libraries
+// Copyright 2024 by Bernhard Heinloth <heinloth@cs.fau.de>
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
 #define _GNU_SOURCE
 #include <linux/limits.h>
 
@@ -11,25 +15,47 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <unistd.h>
 #include <search.h>
 #include <pthread.h>
 #include <sys/mman.h>
 #include <sys/inotify.h>
+#include <sys/sendfile.h>
 #include <sys/stat.h>
 #include <stdarg.h>
 #include <time.h>
 
+/*** Start of configuration ***/
 
+// Libraries to ignore for live updates
+static const char * ignore_libs[] = { "linux-vdso.so.1", "/libc.so.6", "/ld-linux-x86-64.so.2", "/libelf.so.1", "/libz.so.1", "/live.so" };
+
+// Delay between modification event and update in microseconds
+// (this can be handy to prevent an update after file was removed but before the new version was installed)
+const useconds_t update_delay = 20000;
+
+// Maximum number of libraries to handle
+// (upper limit of loaded libraries, sum of all initial and each updated version)
+const size_t lib_hash_max_elements = 1000;
+
+// Default page size
+static int pagesize = 0x1000;
+
+/*** End of configuration ***/
+
+
+// Macros for logging
 #define ERR(FMT,...) logmsg(ERROR, __BASE_FILE__, __LINE__, FMT, __VA_ARGS__)
 #define WARN(FMT,...) logmsg(WARNING, __BASE_FILE__, __LINE__, FMT, __VA_ARGS__)
 #define LOG(FMT,...) logmsg(INFO, __BASE_FILE__, __LINE__, FMT, __VA_ARGS__)
 #define DBG(FMT,...) logmsg(DEBUG, __BASE_FILE__, __LINE__, FMT, __VA_ARGS__)
 
+// Helper to count elements in array
 #define COUNT(x) (sizeof(x)/sizeof(x[0]))
-#define MAX_HASH_LIBS 1000
 
+// Supported logging levels
 enum LogLevel {
 	ERROR   =  0,
 	WARNING =  1,
@@ -39,6 +65,8 @@ enum LogLevel {
 
 struct Identity;
 struct Lib;
+
+// Library instance (representing either initial version or a specific updated version of a library)
 typedef struct Lib {
 	char * realpath;
 	unsigned version;
@@ -51,6 +79,7 @@ typedef struct Lib {
 	struct Identity * base;
 } lib_t;
 
+// Representation of a single writable segment (which has to be shared)
 typedef struct SharedMem {
 	int fd;
 	int flags;
@@ -59,6 +88,7 @@ typedef struct SharedMem {
 	size_t align;
 } sharedmem_t;
 
+// Library identity (reference to a library)
 typedef struct Identity {
 	int wd;
 	char * path;
@@ -68,20 +98,13 @@ typedef struct Identity {
 	lib_t * current;
 } identity_t;
 
-// Libraries to ignore for live updates
-const char * ignore_libs[] = { "linux-vdso.so.1", "/libc.so.6", "/ld-linux-x86-64.so.2", "/libelf.so.1", "/libz.so.1", "/live.so" };
+// Mapping library path to version
+static struct hsearch_data lib_hash;
 
-// Default page size
-int pagesize = 0x1000;
-
-// Delay between modification event and update in microseconds
-// (this can be handy to prevent an update after file was removed but before the new version was installed)
-const useconds_t update_delay = 20000;
-
-struct hsearch_data lib_hash;
-
+// Count of library identieties
 static size_t identities = 0;
-identity_t * identity = NULL;
+static identity_t * identity = NULL;
+static sharedmem_t ** fork_sharedmem = NULL;
 
 static int inotify_fd = -1;
 static const int inotify_flags = IN_MODIFY | IN_DELETE_SELF | IN_MOVE_SELF | IN_DONT_FOLLOW;
@@ -96,12 +119,16 @@ static void logmsg(enum LogLevel level, const char * file, unsigned line, const 
 		level = DEBUG;
 	if (level <= loglevel) {
 		const char * intro[] = { "\e[41;30m ERROR \e[40;31m", "\e[43;30mWARNING\e[40;33m", "\e[47;30m INFO  \e[40;37m", "\e[7;1m DEBUG \e[0;40m" };
-		fprintf(stderr, "%s %6lu %6lu %s:%-4u \e[49m ", intro[level], (long unsigned)(time(NULL) - logstart), (long unsigned)getpid(), file, line);
+		char buf[1024] = {};
+		int n = snprintf(buf, 1023, "%s %6lu %6lu %s:%-4u \e[49m ", intro[level], (long unsigned)(time(NULL) - logstart), (long unsigned)getpid(), file, line);
+		if (n < 0)
+			abort();
 		va_list args;
 		va_start(args, format);
-		vfprintf(stderr, format, args);
+		if (vsnprintf(buf + n, 1023 - n, format, args) < 0)
+			abort();
 		va_end(args);
-		fputs("\e[0m\n", stderr);
+		fprintf(stderr, "%s\e[0m\n", buf);
 	}
 }
 
@@ -156,7 +183,7 @@ static lib_t * dlload(const char * path) {
 }
 
 
-static bool mapsharedmem(const lib_t * lib, sharedmem_t * s) {
+static bool map_sharedmem(const lib_t * lib, sharedmem_t * s) {
 	size_t offset = s->addr % s->align;
 	uintptr_t mem_page_addr = s->addr + lib->addr - offset;
 	size_t mem_page_size = s->size + offset;
@@ -277,13 +304,13 @@ static void elfread(lib_t * lib) {
 				}
 
 				for (size_t i = 0; i < shmem_num; i++) {
-					if (!mapsharedmem(lib, shmem + i))
+					if (!map_sharedmem(lib, shmem + i))
 						success = false;
 				}
 				if (lib->version == 0 && shmem_num > 0) {
 					if ((lib->base->sharedmem = malloc(sizeof(sharedmem_t) * shmem_num)) == NULL) {
-						ERR("Unable to allocate memory for %zu shared memory entries", shmem_num);
-						exit(EXIT_FAILURE);
+						ERR("Unable to allocate memory for %zu shared memory entries - aborting.", shmem_num);
+						abort();
 					}
 					memcpy(lib->base->sharedmem, shmem, sizeof(sharedmem_t) * shmem_num);
 					lib->base->sharedmemsz = shmem_num;
@@ -365,59 +392,77 @@ static void relink_got(lib_t * lib) {
 	}
 }
 
+static int memfddup(const char * name, int src_fd, ssize_t len) {
+	if (src_fd < 0)
+		return -1;
 
-static char * persistentfile(identity_t * base) {
+	errno = 0;
+	int mem_fd = memfd_create(name, MFD_CLOEXEC | MFD_ALLOW_SEALING);
+	if (mem_fd == -1) {
+		ERR("Creating memory fd copy %s failed: %s", name, strerror(errno));
+	} else {
+		lseek(src_fd, 0, SEEK_SET);
+		while (true) {
+			errno = 0;
+			ssize_t s = sendfile(mem_fd, src_fd, NULL, len);
+			if (s == -1) {
+				DBG("Copying %s file failed: %s ", name, strerror(errno));
+				break;
+			} else if ((len -= s) <= 0) {
+				break;
+			}
+		}
+		errno = 0;
+		if (fcntl(mem_fd, F_ADD_SEALS, F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL) == -1) {
+			WARN("Sealing memory fd for %s failed: %s", name, strerror(errno));
+			// continue
+		}
+	}
+	return mem_fd;
+}
+
+static char * persistent_file(identity_t * base) {
 	struct stat path_stat;
 	if (stat(base->path, &path_stat) == -1) {
 		WARN("Not able to stat %s: %s", base->path, strerror(errno));
 	} else if (S_ISREG(path_stat.st_mode)) { // TODO
 		LOG("%s has mask %o", base->path, path_stat.st_mode);
 		// Create a memory copy of the library
-		char fdname[PATH_MAX];
-		snprintf(fdname, PATH_MAX, "%s#%u", base->name, base->current->version + 1);
-		int mem_fd = memfd_create(fdname, MFD_CLOEXEC | MFD_ALLOW_SEALING);
-		if (mem_fd == -1) {
-			WARN("Creating memory fd for copy of %s v%u failed: %s",  base->name, base->current->version, strerror(errno));
+		errno = 0;
+		int src_fd = open(base->path, O_RDONLY);
+		if (src_fd == -1) {
+			ERR("Unable to open %s: %s", base->path, strerror(errno));
 		} else {
-			int src_fd = open(base->path, O_RDONLY);
-			if (src_fd == -1) {
-				WARN("Unable to open %s: %s", base->path, strerror(errno));
-			} else {
-				ssize_t len = path_stat.st_size;
-				while (true) {
-					off_t off_mem_fd = 0;
-					off_t off_src_fd = 0;
-					ssize_t s  = copy_file_range(mem_fd, &off_mem_fd, src_fd, &off_src_fd, len, 0);
-					if (s == -1) {
-						DBG("Copying %s file range failed: %s ", base->path, strerror(errno));
-						// TODO: Fall back to old fashion memcpy
-						break;
-					} else if ((len -= s) <= 0) {
-						break;
-					}
-				}
-				fcntl(mem_fd, F_ADD_SEALS, F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL);
+			char fdname[PATH_MAX];
+			snprintf(fdname, PATH_MAX, "%s#%u", base->name, base->current->version + 1);
+			int mem_fd = memfddup(fdname, src_fd, path_stat.st_size);
+			close(src_fd);
+			if (mem_fd != -1) {
 				char * path;
 				asprintf(&path, "/proc/self/fd/%d", mem_fd);
 				return path;
 			}
 		}
-	} else {
-		char * path = realpath(base->path, NULL);
-		if (path == NULL)
-			WARN("Unable to resolve path %s: %s", base->path, strerror(errno));
-		else
-			return path;
 	}
-	DBG("Using default path %s", base->path);
-	return strdup(base->path);
+
+	char * path = realpath(base->path, NULL);
+	if (path == NULL) {
+		WARN("Unable to resolve path %s: %s", base->path, strerror(errno));
+		return strdup(base->path);
+	} else {
+		return path;
+	}
 }
 
 
 void *thread_watch(void *arg) {
 	(void) arg;
-	/* TODO: Endlosschleife mit inotify abwarten, dann bei Änderung lib neu laden aufrufen */
 	char buf[4096] __attribute__ ((aligned(__alignof__(struct inotify_event))));
+	sigset_t set;
+	sigfillset(&set);
+	int e = pthread_sigmask(SIG_BLOCK, &set, NULL);
+	if (e != 0)
+		WARN("Unable to block signals in watch thread: %s", strerror(e));
 	while (true) {
 		// Wait for events (blocking)
 		ssize_t len = read(inotify_fd, buf, sizeof(buf));
@@ -425,9 +470,14 @@ void *thread_watch(void *arg) {
 			ERR("Aborting since reading from inotify descriptor failed: %s", strerror(errno));
 			return 0;
 		}
+
+		e = pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+		if (e != 0)
+			WARN("Unable to disable cancel in watch thread: %s", strerror(e));
 		// Parse events
 		const struct inotify_event * event;
 		for (char *ptr = buf; ptr < buf + len; ptr += sizeof(struct inotify_event) + event->len) {
+			WARN("THREAD WATCHER ptr %p", ptr);
 			event = (const struct inotify_event *) ptr;
 			if (event->mask & IN_IGNORED)
 				continue;
@@ -445,7 +495,7 @@ void *thread_watch(void *arg) {
 							DBG("Checksum %x has not changed to %s v%u - ignoring.", checksum, identity[i].name, identity[i].current->version);
 						// Do the update
 						} else {
-							char * path = persistentfile(identity + i);
+							char * path = persistent_file(identity + i);
 							lib_t * lib = dlload(path);
 							if (lib != NULL) {
 								lib->addr = ((struct link_map *)(lib->handle))->l_addr;  // hack
@@ -487,6 +537,9 @@ void *thread_watch(void *arg) {
 				DBG("Unhandled event: %d", event->mask);
 			}
 		}
+		e = pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+		if (e != 0)
+			WARN("Unable to enable cancel in watch thread: %s", strerror(e));
 	}
 	return NULL;
 }
@@ -494,23 +547,126 @@ void *thread_watch(void *arg) {
 static void thread_watcher_install() {
 	int e = pthread_create(&thread_watcher, NULL, thread_watch, NULL);
 	if (e != 0) {
-		ERR("Creating thread failed: %s", strerror(e));
-		exit(EXIT_FAILURE);
+		ERR("Creating thread failed: %s - aborting", strerror(e));
+		abort();
 	}
-	pthread_detach(thread_watcher);
+}
+
+static void thread_watcher_remove() {
+	int e = pthread_cancel(thread_watcher);
+	if (e != 0) {
+		WARN("Sending kill signal to watcher thread failed: %s", strerror(e));
+	} else {
+		struct timespec ts;
+		errno = 0;
+		if (clock_gettime(CLOCK_REALTIME, &ts) == -1) {
+			WARN("Getting wall clock time failed: %s", strerror(errno));
+			e = pthread_join(thread_watcher, NULL);
+		} else {
+			ts.tv_sec += 10;  // wait no more then 10 seconds
+			e = pthread_timedjoin_np(thread_watcher, NULL, &ts);
+		}
+		if (e != 0) {
+			WARN("Joining watcher thread failed: %s", strerror(e));
+			pthread_kill(thread_watcher, SIGKILL);
+		}
+	}
 }
 
 static void fork_prepare(void) {
-	// TODO: Duplicate all shared memory
+	DBG("Stopping watcher thread before fork() in %lu", (long unsigned)gettid());
+	thread_watcher_remove();
+
+	DBG("Cloning shared memory before fork() in %lu", (long unsigned)gettid());
+	if ((fork_sharedmem = calloc(identities, sizeof(sharedmem_t *))) == NULL) {
+		ERR("Cannot allocate %zu shared memory pointer storages", identities);
+		abort();
+	}
+	for (size_t i = 0; i < identities; i++) {
+		if (identity[i].sharedmem != NULL) {
+			if ((fork_sharedmem[i] = calloc(identity[i].sharedmemsz, sizeof(sharedmem_t))) == NULL) {
+				ERR("Cannot allocate %zu shared memory storages", identity[i].sharedmemsz);
+				abort();
+			}
+			sharedmem_t * shmem = fork_sharedmem[i];
+			for (size_t j = 0; j < identity[i].sharedmemsz; j++) {
+				shmem[j] = identity[i].sharedmem[j];
+				if (shmem[j].fd < 0)
+					continue;
+
+				char fdname[PATH_MAX];
+				snprintf(fdname, PATH_MAX, "shmem#%s#%p", identity[i].name, (void*)(shmem[j].addr));
+				if ((shmem[j].fd = memfddup(fdname, shmem[j].fd, shmem[j].size)) == -1) {
+					ERR("Abort due to inability to clone memory %s", fdname);
+					abort();
+				}
+			}
+		}
+	}
 }
 
 static void fork_parent(void) {
-	// TODO: Close duplicates
+	DBG("Closing cloned shared memory after fork() in %lu", (long unsigned)gettid());
+	for (size_t i = 0; i < identities; i++) {
+		sharedmem_t * shmem = fork_sharedmem[i];
+		for (size_t j = 0; j < identity[i].sharedmemsz; j++) {
+			assert(shmem != NULL);
+			close(shmem[j].fd);
+		}
+		free(shmem);
+	}
+	free(fork_sharedmem);
+	fork_sharedmem = NULL;
+
+	DBG("Starting watcher thread after fork() in %lu (parent)", (long unsigned)gettid());
+	thread_watcher_install();
 }
 
 static void fork_child(void) {
-	// TODO: Replace originals with duplicates
-	// Start watcher thread
+	DBG("Setting up cloned shared memory after fork() in %lu (child)", (long unsigned)gettid());
+	for (size_t i = 0; i < identities; i++) {
+		sharedmem_t * shmem = fork_sharedmem[i];
+		for (size_t j = 0; j < identity[i].sharedmemsz; j++)
+			if (identity[i].sharedmem[j].fd != -1) {
+				assert(shmem != identity[i].sharedmem);
+				assert(shmem[j].fd != identity[i].sharedmem[j].fd);
+				assert(shmem[j].addr == identity[i].sharedmem[j].addr);
+				assert(shmem[j].size == identity[i].sharedmem[j].size);
+				assert(shmem[j].flags == identity[i].sharedmem[j].flags);
+
+				for (lib_t * l = identity[i].current; l != NULL; l = l->prev) {
+					size_t offset = shmem->addr % shmem->align;
+					uintptr_t mem_page_addr = shmem->addr + l->addr - offset;
+					size_t mem_page_size = shmem->size + offset;
+					errno = 0;
+					if (munmap((void*)mem_page_addr, mem_page_size) != 0)
+						WARN("Unable to unmap %p (%zu bytes): %s", (void*)(identity[i].sharedmem[j].addr), identity[i].sharedmem[j].size, strerror(errno));
+					errno = 0;
+					if (mmap((void*)mem_page_addr, mem_page_size, shmem[j].flags, MAP_SHARED | MAP_FIXED, shmem[j].fd, 0) == MAP_FAILED) {
+						ERR("Unable to create shared memory %d at %p (%zu bytes) in %s: %s", shmem[j].fd, (void*)(shmem[j].addr), shmem[j].size, identity[i].name, strerror(errno));
+						abort();
+					} else {
+						DBG("Recreated shared memory %d at %p (%zu bytes) in %s", shmem[j].fd, (void*)(shmem[j].addr), shmem[j].size, identity[i].name);
+					}
+				}
+				close(identity[i].sharedmem[j].fd);
+			}
+		free(identity[i].sharedmem);
+		identity[i].sharedmem = shmem;
+	}
+	free(fork_sharedmem);
+	fork_sharedmem = NULL;
+
+	DBG("Reinstalling file notifications after fork() in %lu (child)", (long unsigned)gettid());
+	for (size_t i = 0; i < identities; i++) {
+		if (identity[i].wd != -1 && inotify_rm_watch(inotify_fd, identity[i].wd) != 0)
+			WARN("Unable to remove watch for %s: %s", identity[i].path, strerror(errno));
+
+		if ((identity[i].wd = inotify_add_watch(inotify_fd, identity[i].path, inotify_flags)) == -1)
+			WARN("Cannot reinstall watch %s for changes: %s", identity[i].path, strerror(errno));
+	}
+
+	DBG("Starting watcher thread after fork() in %lu (child)", (long unsigned)gettid());
 	thread_watcher_install();
 }
 
@@ -554,7 +710,7 @@ static __attribute__((constructor)) bool init() {
 		ERR("Cannot allocate %zu library identities", identities);
 		return false;
 	}
-	hcreate_r(MAX_HASH_LIBS, &lib_hash);
+	hcreate_r(lib_hash_max_elements, &lib_hash);
 
 	// Main program will iterate over link map to recursively load all other libs
 	size_t i = 0;
@@ -611,6 +767,7 @@ static __attribute__((constructor)) bool init() {
 }
 
 static __attribute__((destructor)) bool fini() {
-	LOG("Cleanup %s", "Foo");
+	DBG("Stopping watcher thread of %lu", (long unsigned)getpid());
+	thread_watcher_remove();
 	return true;
 }

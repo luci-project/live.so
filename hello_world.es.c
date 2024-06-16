@@ -1,9 +1,12 @@
 #include <stdio.h>
 
-char * hello = "Hola";
+static int counter = 0;
+
+const char * const hello = "Hola";
 
 char * world() {
 	fputs("Llamado world()\n", stderr);
+	counter++;
 	return "mundo";
 }
 

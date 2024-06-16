@@ -1,9 +1,11 @@
 #include <stdio.h>
 
-char * hello = "Hallo";
+static int counter = 0;
+
+const char * const hello = "Hallo";
 
 char * world() {
-	fprintf(stderr, "world() aufgerufen\n");
+	fprintf(stderr, "world() %dx aufgerufen\n", counter++);
 	return "Welt";
 }
 
