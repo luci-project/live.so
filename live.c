@@ -47,10 +47,10 @@ static int pagesize = 0x1000;
 
 
 // Macros for logging
-#define ERR(FMT,...) logmsg(ERROR, __BASE_FILE__, __LINE__, FMT, __VA_ARGS__)
-#define WARN(FMT,...) logmsg(WARNING, __BASE_FILE__, __LINE__, FMT, __VA_ARGS__)
-#define LOG(FMT,...) logmsg(INFO, __BASE_FILE__, __LINE__, FMT, __VA_ARGS__)
-#define DBG(FMT,...) logmsg(DEBUG, __BASE_FILE__, __LINE__, FMT, __VA_ARGS__)
+#define ERR(FMT,...) logmsg(ERROR, __BASE_FILE__, __LINE__, FMT, ## __VA_ARGS__)
+#define WARN(FMT,...) logmsg(WARNING, __BASE_FILE__, __LINE__, FMT, ## __VA_ARGS__)
+#define LOG(FMT,...) logmsg(INFO, __BASE_FILE__, __LINE__, FMT, ## __VA_ARGS__)
+#define DBG(FMT,...) logmsg(DEBUG, __BASE_FILE__, __LINE__, FMT, ## __VA_ARGS__)
 
 // Helper to count elements in array
 #define COUNT(x) (sizeof(x)/sizeof(x[0]))
@@ -118,17 +118,19 @@ static void logmsg(enum LogLevel level, const char * file, unsigned line, const 
 	if (level > DEBUG)
 		level = DEBUG;
 	if (level <= loglevel) {
-		const char * intro[] = { "\e[41;30m ERROR \e[40;31m", "\e[43;30mWARNING\e[40;33m", "\e[47;30m INFO  \e[40;37m", "\e[7;1m DEBUG \e[0;40m" };
-		char buf[1024] = {};
-		int n = snprintf(buf, 1023, "%s %6lu %6lu %s:%-4u \e[49m ", intro[level], (long unsigned)(time(NULL) - logstart), (long unsigned)getpid(), file, line);
+		int e = errno;
+		const char * intro[] = { "\x1b[41;30m ERROR \x1b[40;31m", "\x1b[43;30mWARNING\x1b[40;33m", "\x1b[47;30m INFO  \x1b[40;37m", "\x1b[7;1m DEBUG \x1b[0;40m" };
+		char buf[1024] = { '\0' };
+		int n = snprintf(buf, 1023, "%s %6lu %6lu %s:%-4u \x1b[49m ", intro[level], (long unsigned)(time(NULL) - logstart), (long unsigned)getpid(), file, line);
 		if (n < 0)
 			abort();
 		va_list args;
 		va_start(args, format);
+		errno = e;
 		if (vsnprintf(buf + n, 1023 - n, format, args) < 0)
 			abort();
 		va_end(args);
-		fprintf(stderr, "%s\e[0m\n", buf);
+		fprintf(stderr, "%s\x1b[0m\n", buf);
 	}
 }
 
@@ -149,19 +151,19 @@ static uint32_t filechecksum(const char *path) {
 
 	int fd = open(path, O_RDONLY);
 	if (fd == -1) {
-		WARN("Unable to open %s: %s", path, strerror(errno));
+		WARN("Unable to open %s: %m", path);
 	} else {
 		char buf[4096];
 		ssize_t len;
 		while ((len = read(fd, buf, COUNT(buf))) > 0)
-			for (size_t i = 0; i < len; i++) {
+			for (ssize_t i = 0; i < len; i++) {
 				crc ^= buf[i];
-				for (size_t j = 0; j < 8; j++)
+				for (ssize_t j = 0; j < 8; j++)
 					crc = (crc >> 1) ^ (0xedb88320 & -(crc & 1));
 			}
 		close(fd);
 		if (len == -1)
-			WARN("Error reading %s for checksum: %s", path, strerror(errno));
+			WARN("Error reading %s for checksum: %m", path);
 		else
 			DBG("Checksum of %s is %x", path, ~crc);
 	}
@@ -193,7 +195,7 @@ static bool map_sharedmem(const lib_t * lib, sharedmem_t * s) {
 		snprintf(fdname, PATH_MAX, "shmem#%s#%p", lib->base->name, (void*)(s->addr));
 
 		if ((s->fd = memfd_create(fdname, MFD_CLOEXEC | MFD_ALLOW_SEALING)) == -1) {
-			ERR("Creating memory fd for %p of %s v%u failed: %s", (void*)(s->addr), lib->base->name, lib->version, strerror(errno));
+			ERR("Creating memory fd for %p of %s v%u failed: %m", (void*)(s->addr), lib->base->name, lib->version);
 			close(s->fd);
 			s->fd = -1;
 			return false;
@@ -201,7 +203,7 @@ static bool map_sharedmem(const lib_t * lib, sharedmem_t * s) {
 		for (size_t written = 0; written < mem_page_size;) {
 			ssize_t w = write(s->fd, (void*)(mem_page_addr + written), mem_page_size - written);
 			if (w == -1) {
-				ERR("Writing memory %zu bytes from %p for %p of %s v%u failed: %s", mem_page_size - written, (void*)(mem_page_addr + written), (void*)(s->addr), lib->base->name, lib->version, strerror(errno));
+				ERR("Writing memory %zu bytes from %p for %p of %s v%u failed: %m", mem_page_size - written, (void*)(mem_page_addr + written), (void*)(s->addr), lib->base->name, lib->version);
 				close(s->fd);
 				s->fd = -1;
 				return false;
@@ -210,11 +212,11 @@ static bool map_sharedmem(const lib_t * lib, sharedmem_t * s) {
 			}
 		}
 		if (fcntl(s->fd, F_ADD_SEALS, F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL) == -1) {
-			LOG("Sealing memory fd for %p of %s v%u failed: %s", (void*)(s->addr), lib->base->name, lib->version, strerror(errno));
+			LOG("Sealing memory fd for %p of %s v%u failed: %m", (void*)(s->addr), lib->base->name, lib->version);
 			// continue
 		}
 		if (mmap((void*)mem_page_addr, mem_page_size, s->flags, MAP_SHARED | MAP_FIXED, s->fd, 0) == MAP_FAILED) {
-			ERR("Unable to create shared memory %d at %p (%zu bytes) in %s v%u: %s", s->fd, (void*)(s->addr), s->size, lib->base->name, lib->version, strerror(errno));
+			ERR("Unable to create shared memory %d at %p (%zu bytes) in %s v%u: %m", s->fd, (void*)(s->addr), s->size, lib->base->name, lib->version);
 			close(s->fd);
 			s->fd = -1;
 			return false;
@@ -231,7 +233,7 @@ static bool map_sharedmem(const lib_t * lib, sharedmem_t * s) {
 					ERR("Not a valid shared memory for %p (%zu bytes) in %s v%u", (void*)(s->addr), s->size, lib->base->name, lib->version);
 					return false;
 				} else if (mmap((void*)mem_page_addr, mem_page_size, s->flags, MAP_SHARED | MAP_FIXED, f->fd, 0) == MAP_FAILED) {
-					ERR("Unable to map shared memory %d at %p (%zu bytes) in %s v%u: %s", f->fd, (void*)(s->addr), s->size, lib->base->name, lib->version, strerror(errno));
+					ERR("Unable to map shared memory %d at %p (%zu bytes) in %s v%u: %m", f->fd, (void*)(s->addr), s->size, lib->base->name, lib->version);
 					return false;
 				} else {
 					LOG("Mapped shared memory %d at %p (%zu bytes) in %s v%u", f->fd, (void*)(s->addr), s->size, lib->base->name, lib->version);
@@ -244,7 +246,7 @@ static bool map_sharedmem(const lib_t * lib, sharedmem_t * s) {
 	}
 }
 
-static void elfread(lib_t * lib) {
+static bool elfread(lib_t * lib) {
 	assert(lib != NULL);
 	assert(lib->base != NULL);
 	assert(lib->base->current != NULL);
@@ -252,8 +254,8 @@ static void elfread(lib_t * lib) {
 	bool success = true;
 	int fd = open(lib->realpath, O_RDONLY);
 	if (fd == -1) {
-		LOG("Opening %s failed: %s", lib->realpath, strerror(errno));
-		return;
+		LOG("Opening %s failed: %m", lib->realpath);
+		return false;
 	}
 	Elf * elf = elf_begin (fd, ELF_C_READ, NULL);
 	if (elf == NULL) {
@@ -350,7 +352,9 @@ static void elfread(lib_t * lib) {
 	uintptr_t addr = lib->addr + lib->got & (~(pagesize-1));
 	size_t len = lib->addr + lib->got + lib->gotsz - addr;
 	if (mprotect((void*)addr, len, PROT_READ | PROT_WRITE) != 0)
-		LOG("(Un)protecting %lx (%zu bytes) in %s v%u failed: %s", lib->addr + addr, len, lib->base->name, lib->version, strerror(errno));
+		LOG("(Un)protecting %lx (%zu bytes) in %s v%u failed: %m", lib->addr + addr, len, lib->base->name, lib->version);
+
+	return success;
 }
 
 
@@ -399,14 +403,14 @@ static int memfddup(const char * name, int src_fd, ssize_t len) {
 	errno = 0;
 	int mem_fd = memfd_create(name, MFD_CLOEXEC | MFD_ALLOW_SEALING);
 	if (mem_fd == -1) {
-		ERR("Creating memory fd copy %s failed: %s", name, strerror(errno));
+		ERR("Creating memory fd copy %s failed: %m", name);
 	} else {
 		lseek(src_fd, 0, SEEK_SET);
 		while (true) {
 			errno = 0;
 			ssize_t s = sendfile(mem_fd, src_fd, NULL, len);
 			if (s == -1) {
-				DBG("Copying %s file failed: %s ", name, strerror(errno));
+				DBG("Copying %s file failed: %m", name);
 				break;
 			} else if ((len -= s) <= 0) {
 				break;
@@ -414,7 +418,7 @@ static int memfddup(const char * name, int src_fd, ssize_t len) {
 		}
 		errno = 0;
 		if (fcntl(mem_fd, F_ADD_SEALS, F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL) == -1) {
-			WARN("Sealing memory fd for %s failed: %s", name, strerror(errno));
+			WARN("Sealing memory fd for %s failed: %m", name);
 			// continue
 		}
 	}
@@ -424,14 +428,14 @@ static int memfddup(const char * name, int src_fd, ssize_t len) {
 static char * persistent_file(identity_t * base) {
 	struct stat path_stat;
 	if (stat(base->path, &path_stat) == -1) {
-		WARN("Not able to stat %s: %s", base->path, strerror(errno));
+		WARN("Not able to stat %s: %m", base->path);
 	} else if (S_ISREG(path_stat.st_mode)) { // TODO
 		LOG("%s has mask %o", base->path, path_stat.st_mode);
 		// Create a memory copy of the library
 		errno = 0;
 		int src_fd = open(base->path, O_RDONLY);
 		if (src_fd == -1) {
-			ERR("Unable to open %s: %s", base->path, strerror(errno));
+			ERR("Unable to open %s: %m", base->path);
 		} else {
 			char fdname[PATH_MAX];
 			snprintf(fdname, PATH_MAX, "%s#%u", base->name, base->current->version + 1);
@@ -439,15 +443,17 @@ static char * persistent_file(identity_t * base) {
 			close(src_fd);
 			if (mem_fd != -1) {
 				char * path;
-				asprintf(&path, "/proc/self/fd/%d", mem_fd);
-				return path;
+				if (asprintf(&path, "/proc/self/fd/%d", mem_fd) == -1)
+					ERR("Unable to allocate memory for asprintf");
+				else
+					return path;
 			}
 		}
 	}
 
 	char * path = realpath(base->path, NULL);
 	if (path == NULL) {
-		WARN("Unable to resolve path %s: %s", base->path, strerror(errno));
+		WARN("Unable to resolve path %s: %m", base->path);
 		return strdup(base->path);
 	} else {
 		return path;
@@ -467,7 +473,7 @@ void *thread_watch(void *arg) {
 		// Wait for events (blocking)
 		ssize_t len = read(inotify_fd, buf, sizeof(buf));
 		if (len == -1 && errno != EAGAIN) {
-			ERR("Aborting since reading from inotify descriptor failed: %s", strerror(errno));
+			ERR("Aborting since reading from inotify descriptor failed: %m");
 			return 0;
 		}
 
@@ -477,7 +483,6 @@ void *thread_watch(void *arg) {
 		// Parse events
 		const struct inotify_event * event;
 		for (char *ptr = buf; ptr < buf + len; ptr += sizeof(struct inotify_event) + event->len) {
-			WARN("THREAD WATCHER ptr %p", ptr);
 			event = (const struct inotify_event *) ptr;
 			if (event->mask & IN_IGNORED)
 				continue;
@@ -530,7 +535,7 @@ void *thread_watch(void *arg) {
 						}
 						// Install new watch
 						if ((identity[i].wd = inotify_add_watch(inotify_fd, identity[i].path, inotify_flags)) == -1)
-							WARN("Cannot reinstall watch %s for changes: %s", identity[i].path, strerror(errno));
+							WARN("Cannot reinstall watch %s for changes: %m", identity[i].path);
 
 					}
 			} else {
@@ -545,6 +550,11 @@ void *thread_watch(void *arg) {
 }
 
 static void thread_watcher_install() {
+	DBG("Install inotify watches for shared objects");
+	for (size_t i = 0; i < identities; i++)
+		if ((identity[i].wd = inotify_add_watch(inotify_fd, identity[i].path, inotify_flags)) == -1)
+			WARN("Cannot watch %s for changes: %m", identity[i].path);
+
 	int e = pthread_create(&thread_watcher, NULL, thread_watch, NULL);
 	if (e != 0) {
 		ERR("Creating thread failed: %s - aborting", strerror(e));
@@ -560,7 +570,7 @@ static void thread_watcher_remove() {
 		struct timespec ts;
 		errno = 0;
 		if (clock_gettime(CLOCK_REALTIME, &ts) == -1) {
-			WARN("Getting wall clock time failed: %s", strerror(errno));
+			WARN("Getting wall clock time failed: %m");
 			e = pthread_join(thread_watcher, NULL);
 		} else {
 			ts.tv_sec += 10;  // wait no more then 10 seconds
@@ -571,6 +581,11 @@ static void thread_watcher_remove() {
 			pthread_kill(thread_watcher, SIGKILL);
 		}
 	}
+
+	DBG("Removing inotify watches for shared objects");
+	for (size_t i = 0; i < identities; i++)
+		if (identity[i].wd != -1 && inotify_rm_watch(inotify_fd, identity[i].wd) != 0)
+			WARN("Unable to remove watch for %s: %m", identity[i].path);
 }
 
 static void fork_prepare(void) {
@@ -640,10 +655,10 @@ static void fork_child(void) {
 					size_t mem_page_size = shmem->size + offset;
 					errno = 0;
 					if (munmap((void*)mem_page_addr, mem_page_size) != 0)
-						WARN("Unable to unmap %p (%zu bytes): %s", (void*)(identity[i].sharedmem[j].addr), identity[i].sharedmem[j].size, strerror(errno));
+						WARN("Unable to unmap %p (%zu bytes): %m", (void*)(identity[i].sharedmem[j].addr), identity[i].sharedmem[j].size);
 					errno = 0;
 					if (mmap((void*)mem_page_addr, mem_page_size, shmem[j].flags, MAP_SHARED | MAP_FIXED, shmem[j].fd, 0) == MAP_FAILED) {
-						ERR("Unable to create shared memory %d at %p (%zu bytes) in %s: %s", shmem[j].fd, (void*)(shmem[j].addr), shmem[j].size, identity[i].name, strerror(errno));
+						ERR("Unable to create shared memory %d at %p (%zu bytes) in %s: %m", shmem[j].fd, (void*)(shmem[j].addr), shmem[j].size, identity[i].name);
 						abort();
 					} else {
 						DBG("Recreated shared memory %d at %p (%zu bytes) in %s", shmem[j].fd, (void*)(shmem[j].addr), shmem[j].size, identity[i].name);
@@ -656,15 +671,6 @@ static void fork_child(void) {
 	}
 	free(fork_sharedmem);
 	fork_sharedmem = NULL;
-
-	DBG("Reinstalling file notifications after fork() in %lu (child)", (long unsigned)gettid());
-	for (size_t i = 0; i < identities; i++) {
-		if (identity[i].wd != -1 && inotify_rm_watch(inotify_fd, identity[i].wd) != 0)
-			WARN("Unable to remove watch for %s: %s", identity[i].path, strerror(errno));
-
-		if ((identity[i].wd = inotify_add_watch(inotify_fd, identity[i].path, inotify_flags)) == -1)
-			WARN("Cannot reinstall watch %s for changes: %s", identity[i].path, strerror(errno));
-	}
 
 	DBG("Starting watcher thread after fork() in %lu (child)", (long unsigned)gettid());
 	thread_watcher_install();
@@ -680,18 +686,18 @@ static __attribute__((constructor)) bool init() {
 	// Get defaults
 	pagesize = sysconf(_SC_PAGE_SIZE);
 	if (pagesize == -1)
-		WARN("Unable to get page size: %s", strerror(errno));
+		WARN("Unable to get page size: %m");
 
 	// Install inotify watch
 	if ((inotify_fd = inotify_init1(IN_CLOEXEC)) == -1) {
-		ERR("Unable to initialize inotify: %s", strerror(errno));
+		ERR("Unable to initialize inotify: %m");
 		return false;
 	}
 
 	// Load main program
 	lib_t * main = dlload(NULL);
 	if (main == NULL) {
-		ERR("Unable to load main program %s", "");
+		ERR("Unable to load main program");
 		return false;
 	}
 
@@ -699,6 +705,7 @@ static __attribute__((constructor)) bool init() {
 	struct link_map * link_map = NULL;
 	if (dlinfo(main->handle, RTLD_DI_LINKMAP, &link_map) != 0) {
 		ERR("Getting link map failed: %s", dlerror());
+		free(main);
 		return false;
 	}
 
@@ -708,11 +715,13 @@ static __attribute__((constructor)) bool init() {
 			identities++;
 	if ((identity = calloc(identities, sizeof(identity_t))) == NULL) {
 		ERR("Cannot allocate %zu library identities", identities);
+		free(main);
 		return false;
 	}
 	hcreate_r(lib_hash_max_elements, &lib_hash);
 
 	// Main program will iterate over link map to recursively load all other libs
+	bool success = true;
 	size_t i = 0;
 	lib_t * cur;
 	for (struct link_map * l = link_map; l != NULL; l = l->l_next) {
@@ -728,6 +737,7 @@ static __attribute__((constructor)) bool init() {
 			identity[i].path = strndup(l->l_name, PATH_MAX);
 		} else {
 			WARN("Unable to load %s!", l->l_name);
+			success = false;
 			continue;
 		}
 
@@ -740,8 +750,6 @@ static __attribute__((constructor)) bool init() {
 		identity[i].current->addr = l->l_addr;
 		identity[i].current->version = 0;
 		identity[i].current->base = identity + i;
-		if ((identity[i].wd = inotify_add_watch(inotify_fd, identity[i].path, inotify_flags)) == -1)
-			WARN("Cannot watch %s for changes: %s", identity[i].path, strerror(errno));
 
 		// Put in hash map
 		ENTRY *r;
@@ -753,17 +761,22 @@ static __attribute__((constructor)) bool init() {
 		i++;
 	}
 
-	// TODO: int 
-	if ((errno = pthread_atfork(fork_prepare, fork_parent, fork_child)) != 0)
-		WARN("Unable to install fork handler: %s", strerror(errno));
+	// Install fork handler
+	if ((errno = pthread_atfork(fork_prepare, fork_parent, fork_child)) != 0) {
+		WARN("Unable to install fork handler: %m");
+		success = false;
+	}
 
 	// Read (relative) GOT address and size via ELF for each lib
 	elf_version(EV_CURRENT);
 	for (size_t i = 0; i < identities; i++)
-		elfread(identity[i].current);
+		if (!elfread(identity[i].current))
+			success = false;
 
 	// install watcher thread
 	thread_watcher_install();
+
+	return success;
 }
 
 static __attribute__((destructor)) bool fini() {

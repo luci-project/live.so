@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -O0 -g -fPIC
+CFLAGS = -O2 -g -fPIC -Wextra -Wpedantic
 LDFLAGS = -L. -lhw -Wl,-rpath=.
 
 DEMO = run
