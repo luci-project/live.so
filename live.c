@@ -153,7 +153,7 @@ static uint32_t filechecksum(const char *path) {
 	if (fd == -1) {
 		WARN("Unable to open %s: %m", path);
 	} else {
-		char buf[4096];
+		char buf[4096] = { '\0' };
 		ssize_t len;
 		while ((len = read(fd, buf, COUNT(buf))) > 0)
 			for (ssize_t i = 0; i < len; i++) {
@@ -191,7 +191,7 @@ static bool map_sharedmem(const lib_t * lib, sharedmem_t * s) {
 	size_t mem_page_size = s->size + offset;
 
 	if (lib->version == 0) {
-		char fdname[PATH_MAX];
+		char fdname[PATH_MAX] = { '\0' };
 		snprintf(fdname, PATH_MAX, "shmem#%s#%p", lib->base->name, (void*)(s->addr));
 
 		if ((s->fd = memfd_create(fdname, MFD_CLOEXEC | MFD_ALLOW_SEALING)) == -1) {
@@ -437,7 +437,7 @@ static char * persistent_file(identity_t * base) {
 		if (src_fd == -1) {
 			ERR("Unable to open %s: %m", base->path);
 		} else {
-			char fdname[PATH_MAX];
+			char fdname[PATH_MAX] = { '\0' };
 			snprintf(fdname, PATH_MAX, "%s#%u", base->name, base->current->version + 1);
 			int mem_fd = memfddup(fdname, src_fd, path_stat.st_size);
 			close(src_fd);
@@ -493,7 +493,6 @@ void *thread_watch(void *arg) {
 						DBG("Modification event for %s", identity[i].name);
 						inotify_rm_watch(inotify_fd, identity[i].wd);
 						usleep(update_delay);
-						// 
 
 						uint32_t checksum = filechecksum(identity[i].path);
 						if (checksum == identity[i].current->checksum) {
@@ -550,6 +549,12 @@ void *thread_watch(void *arg) {
 }
 
 static void thread_watcher_install() {
+	// Install inotify watch
+	if ((inotify_fd = inotify_init1(IN_CLOEXEC)) == -1) {
+		ERR("Unable to initialize inotify: %m - aborting");
+		abort();
+	}
+
 	DBG("Install inotify watches for shared objects");
 	for (size_t i = 0; i < identities; i++)
 		if ((identity[i].wd = inotify_add_watch(inotify_fd, identity[i].path, inotify_flags)) == -1)
@@ -586,6 +591,9 @@ static void thread_watcher_remove() {
 	for (size_t i = 0; i < identities; i++)
 		if (identity[i].wd != -1 && inotify_rm_watch(inotify_fd, identity[i].wd) != 0)
 			WARN("Unable to remove watch for %s: %m", identity[i].path);
+
+	close(inotify_fd);
+	inotify_fd = -1;
 }
 
 static void fork_prepare(void) {
@@ -609,7 +617,7 @@ static void fork_prepare(void) {
 				if (shmem[j].fd < 0)
 					continue;
 
-				char fdname[PATH_MAX];
+				char fdname[PATH_MAX] = { '\0' };
 				snprintf(fdname, PATH_MAX, "shmem#%s#%p", identity[i].name, (void*)(shmem[j].addr));
 				if ((shmem[j].fd = memfddup(fdname, shmem[j].fd, shmem[j].size)) == -1) {
 					ERR("Abort due to inability to clone memory %s", fdname);
@@ -688,12 +696,6 @@ static __attribute__((constructor)) bool init() {
 	if (pagesize == -1)
 		WARN("Unable to get page size: %m");
 
-	// Install inotify watch
-	if ((inotify_fd = inotify_init1(IN_CLOEXEC)) == -1) {
-		ERR("Unable to initialize inotify: %m");
-		return false;
-	}
-
 	// Load main program
 	lib_t * main = dlload(NULL);
 	if (main == NULL) {
@@ -727,8 +729,9 @@ static __attribute__((constructor)) bool init() {
 	for (struct link_map * l = link_map; l != NULL; l = l->l_next) {
 		if (l->l_name == NULL || strlen(l->l_name) == 0) {
 			identity[i].current = main;
-			char tmp[PATH_MAX + 1];
+			char tmp[PATH_MAX + 1] = { '\0' };
 			identity[i].path = strndup(readlink("/proc/self/exe", tmp, PATH_MAX) < 0 ? "/proc/self/exe" : tmp, PATH_MAX);
+			DBG("Me is %s", identity[i].path);
 		} else if (ignore_lib(l->l_name)) {
 			DBG("Skipping shared library %s", l->l_name);
 			continue;
