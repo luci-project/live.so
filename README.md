@@ -66,14 +66,14 @@ Accordingly, *live.so* creates a memory alias for this segment, allowing old and
 
               Process's virtual memory
                      ┌───────┐
-        PROGRAM code │█████▛▀│
-                data │▄▄▄▖▝▀▀│
+        PROGRAM code │█████▀▀│
+                data │▄▄▄▄ ▀▀│
                      │  ...  │
-    libfoo.so.1 code │███▛▀▀▀│
-                data │▄▄████▛│ ──┐
+    libfoo.so.1 code │███▀▀▀▀│
+                data │▄▄████▀│ ──┐
                      │  ...  │   │ memory
-    libfoo.so.2 code │█████▛▀│   │ alias
-                data │▄▄████▛│ ◄─┘
+    libfoo.so.2 code │██████▀│   │ alias
+                data │▄▄████▀│ ◄─┘
                      └───────┘
 
 No quiescence is required, but the update can happen at any time:
