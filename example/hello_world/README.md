@@ -12,10 +12,10 @@ Compile them by running
 
 	make
 
-The program `run` will use the shared library to get the contents of the constant string `hello` and call the function `world` in a loop (30 times, with 1 second delay in between).
-In addition, the program will do a `fork` after 13 seconds.
+The program `run` will use the shared library to get the contents of the constant string `hello` and call the function `world` in a loop (with 1 second delay in between).
+An optional first parameter limits the number of loops, while a second parameter will specify the loop in which the program calls `fork` (with the child then waits 2 seconds after each loop).
 
-To test the update, either use the [Makefile](example/hello_world/Makefile) target `test`, which will exchange the shared library with a different version every 5 seconds
+To test the update, either use the [Makefile](example/hello_world/Makefile) target `test` for a one minute demonstration, which will exchange the shared library with a different version every 5 seconds and `fork` after 13 seconds
 
 	make test
 
@@ -29,4 +29,4 @@ while adjusting the symbolic link to the shared library at the same time
 	sleep 5
 	ln -f -s libhw-en.so libhw.so
 
-Set the `LIVE_LOGLEVEL` environment variable to `4` for debug output
+For debug output set the `LIVE_LOGLEVEL` environment variable to `4`.

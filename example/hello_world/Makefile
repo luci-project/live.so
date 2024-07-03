@@ -21,7 +21,7 @@ test: all
 		echo "\e[2mChanging symlink $(LIBSYMLINK) to $$LIB\e[0m" ; \
 		ln -f -s $$LIB $(LIBSYMLINK) ; \
 	done &
-	LIVE_LOGLEVEL=$(LIVE_LOGLEVEL) LD_PRELOAD=$(abspath $(LIVESO)) ./$(DEMO)
+	LIVE_LOGLEVEL=$(LIVE_LOGLEVEL) LD_PRELOAD=$(abspath $(LIVESO)) ./$(DEMO) 30 13
 
 
 $(LIVESO):
