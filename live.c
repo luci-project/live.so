@@ -246,6 +246,7 @@ static bool map_sharedmem(const lib_t * lib, sharedmem_t * s) {
 	}
 }
 
+
 static bool elfread(lib_t * lib) {
 	assert(lib != NULL);
 	assert(lib->base != NULL);
@@ -396,6 +397,7 @@ static void relink_got(lib_t * lib) {
 	}
 }
 
+
 static int memfddup(const char * name, int src_fd, ssize_t len) {
 	if (src_fd < 0)
 		return -1;
@@ -424,6 +426,7 @@ static int memfddup(const char * name, int src_fd, ssize_t len) {
 	}
 	return mem_fd;
 }
+
 
 static char * persistent_file(identity_t * base) {
 	struct stat path_stat;
@@ -548,6 +551,7 @@ void *thread_watch(void *arg) {
 	return NULL;
 }
 
+
 static void thread_watcher_install() {
 	// Install inotify watch
 	if ((inotify_fd = inotify_init1(IN_CLOEXEC)) == -1) {
@@ -566,6 +570,7 @@ static void thread_watcher_install() {
 		abort();
 	}
 }
+
 
 static void thread_watcher_remove() {
 	int e = pthread_cancel(thread_watcher);
@@ -595,6 +600,7 @@ static void thread_watcher_remove() {
 	close(inotify_fd);
 	inotify_fd = -1;
 }
+
 
 static void fork_prepare(void) {
 	DBG("Stopping watcher thread before fork() in %lu", (long unsigned)gettid());
@@ -628,6 +634,7 @@ static void fork_prepare(void) {
 	}
 }
 
+
 static void fork_parent(void) {
 	DBG("Closing cloned shared memory after fork() in %lu", (long unsigned)gettid());
 	for (size_t i = 0; i < identities; i++) {
@@ -644,6 +651,7 @@ static void fork_parent(void) {
 	DBG("Starting watcher thread after fork() in %lu (parent)", (long unsigned)gettid());
 	thread_watcher_install();
 }
+
 
 static void fork_child(void) {
 	DBG("Setting up cloned shared memory after fork() in %lu (child)", (long unsigned)gettid());
@@ -684,7 +692,8 @@ static void fork_child(void) {
 	thread_watcher_install();
 }
 
-static __attribute__((constructor)) bool init() {
+
+static bool enable() {
 	// Logging
 	logstart = time(NULL);
 	const char * level = getenv("LIVE_LOGLEVEL");
@@ -782,8 +791,39 @@ static __attribute__((constructor)) bool init() {
 	return success;
 }
 
-static __attribute__((destructor)) bool fini() {
+
+static bool disable() {
 	DBG("Stopping watcher thread of %lu", (long unsigned)getpid());
 	thread_watcher_remove();
 	return true;
 }
+
+
+#ifdef USE_MAIN_WRAPPER
+
+static int (*real_main)(int, char **, char **);
+
+int main_wrapper(int argc, char **argv, char **envp) {
+	enable();
+	int r = real_main(argc, argv, envp);
+	disable();
+	return r;
+}
+
+int __libc_start_main(int (*main) (int, char **, char **), int argc, char ** argv, void (*init) (void), void (*fini) (void), void (*rtld_fini) (void), void (* stack_end)) {
+	real_main = main;
+	typeof(&__libc_start_main) real_libc_start_main = dlsym(RTLD_NEXT, "__libc_start_main");
+	return real_libc_start_main(main_wrapper, argc, argv, init, fini, rtld_fini, stack_end);
+}
+
+#else
+
+static __attribute__((constructor)) bool init() {
+	return enable();
+}
+
+static __attribute__((destructor)) bool fini() {
+	return disable;
+}
+
+#endif
