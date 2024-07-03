@@ -16,6 +16,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <signal.h>
+#include <fnmatch.h>
 #include <stdbool.h>
 #include <unistd.h>
 #include <search.h>
@@ -30,7 +31,14 @@
 /*** Start of configuration ***/
 
 // Libraries to ignore for live updates
-static const char * ignore_libs[] = { "linux-vdso.so.1", "/libc.so.6", "/ld-linux-x86-64.so.2", "/libelf.so.1", "/libz.so.1", "/live.so" };
+static const char * ignore_libs[] = {
+	"linux-vdso.so?(.[0-9])",
+	"/lib?(64)/ld-linux*.so?(.[0-9])",
+	"*(/*)/libc.so.6",
+	"*(/*)/live*.so",
+	"*(/*)/libelf.so?(.[0-9])",
+	"*(/*)/libz.so?(.[0-9])"
+};
 
 // Delay between modification event and update in microseconds
 // (this can be handy to prevent an update after file was removed but before the new version was installed)
@@ -85,7 +93,6 @@ typedef struct SharedMem {
 	int flags;
 	ElfW(Addr) addr;
 	size_t size;
-	size_t align;
 } sharedmem_t;
 
 // Library identity (reference to a library)
@@ -136,11 +143,8 @@ static void logmsg(enum LogLevel level, const char * file, unsigned line, const 
 
 
 static bool ignore_lib(const char * path) {
-	const char * name = strrchr(path, '/');
-	if (name == NULL)
-		name = path;
 	for (size_t i = 0; i < COUNT(ignore_libs); i++)
-		if (strcmp(name, ignore_libs[i]) == 0)
+		if (fnmatch(ignore_libs[i], path, FNM_PATHNAME | FNM_CASEFOLD | FNM_EXTMATCH) == 0)
 			return true;
 	return false;
 }
@@ -186,7 +190,7 @@ static lib_t * dlload(const char * path) {
 
 
 static bool map_sharedmem(const lib_t * lib, sharedmem_t * s) {
-	size_t offset = s->addr % s->align;
+	size_t offset = s->addr % pagesize;
 	uintptr_t mem_page_addr = s->addr + lib->addr - offset;
 	size_t mem_page_size = s->size + offset;
 
@@ -195,7 +199,7 @@ static bool map_sharedmem(const lib_t * lib, sharedmem_t * s) {
 		snprintf(fdname, PATH_MAX, "shmem#%s#%p", lib->base->name, (void*)(s->addr));
 
 		if ((s->fd = memfd_create(fdname, MFD_CLOEXEC | MFD_ALLOW_SEALING)) == -1) {
-			ERR("Creating memory fd for %p of %s v%u failed: %m", (void*)(s->addr), lib->base->name, lib->version);
+			ERR("Creating memory fd for %p + %lx of %s v%u failed: %m", lib->addr, s->addr - offset, lib->base->name, lib->version);
 			close(s->fd);
 			s->fd = -1;
 			return false;
@@ -203,7 +207,7 @@ static bool map_sharedmem(const lib_t * lib, sharedmem_t * s) {
 		for (size_t written = 0; written < mem_page_size;) {
 			ssize_t w = write(s->fd, (void*)(mem_page_addr + written), mem_page_size - written);
 			if (w == -1) {
-				ERR("Writing memory %zu bytes from %p for %p of %s v%u failed: %m", mem_page_size - written, (void*)(mem_page_addr + written), (void*)(s->addr), lib->base->name, lib->version);
+				ERR("Writing memory %zu bytes from %p for %p + %lx of %s v%u failed: %m", mem_page_size - written, (void*)(mem_page_addr + written), lib->addr, s->addr - offset, lib->base->name, lib->version);
 				close(s->fd);
 				s->fd = -1;
 				return false;
@@ -212,16 +216,16 @@ static bool map_sharedmem(const lib_t * lib, sharedmem_t * s) {
 			}
 		}
 		if (fcntl(s->fd, F_ADD_SEALS, F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL) == -1) {
-			LOG("Sealing memory fd for %p of %s v%u failed: %m", (void*)(s->addr), lib->base->name, lib->version);
+			LOG("Sealing memory fd for %p + %lx of %s v%u failed: %m", lib->addr, s->addr - offset, lib->base->name, lib->version);
 			// continue
 		}
 		if (mmap((void*)mem_page_addr, mem_page_size, s->flags, MAP_SHARED | MAP_FIXED, s->fd, 0) == MAP_FAILED) {
-			ERR("Unable to create shared memory %d at %p (%zu bytes) in %s v%u: %m", s->fd, (void*)(s->addr), s->size, lib->base->name, lib->version);
+			ERR("Unable to create shared memory %d at %p + %lx (%zu bytes) in %s v%u: %m", s->fd, lib->addr, s->addr - offset, s->size, lib->base->name, lib->version);
 			close(s->fd);
 			s->fd = -1;
 			return false;
 		} else {
-			LOG("Created shared memory %d at %p (%zu bytes) in %s v%u", s->fd, (void*)(s->addr), s->size, lib->base->name, lib->version);
+			LOG("Created shared memory %d at %p + %lx (%zu bytes) in %s v%u", s->fd, lib->addr, s->addr - offset, s->size, lib->base->name, lib->version);
 			return true;
 		}
 	} else {
@@ -230,13 +234,13 @@ static bool map_sharedmem(const lib_t * lib, sharedmem_t * s) {
 			sharedmem_t * f = lib->base->sharedmem + j;
 			if (s->addr == f->addr && s->size == f->size) {
 				if (f->fd < 0) {
-					ERR("Not a valid shared memory for %p (%zu bytes) in %s v%u", (void*)(s->addr), s->size, lib->base->name, lib->version);
+					ERR("Not a valid shared memory for %p + %lx (%zu bytes) in %s v%u", lib->addr, s->addr - offset, s->size, lib->base->name, lib->version);
 					return false;
 				} else if (mmap((void*)mem_page_addr, mem_page_size, s->flags, MAP_SHARED | MAP_FIXED, f->fd, 0) == MAP_FAILED) {
-					ERR("Unable to map shared memory %d at %p (%zu bytes) in %s v%u: %m", f->fd, (void*)(s->addr), s->size, lib->base->name, lib->version);
+					ERR("Unable to map shared memory %d at %p + %lx (%zu bytes) in %s v%u: %m", f->fd, lib->addr, s->addr - offset, s->size, lib->base->name, lib->version);
 					return false;
 				} else {
-					LOG("Mapped shared memory %d at %p (%zu bytes) in %s v%u", f->fd, (void*)(s->addr), s->size, lib->base->name, lib->version);
+					LOG("Mapped shared memory %d at %p + %lx (%zu bytes) in %s v%u", f->fd, lib->addr, s->addr - offset, s->size, lib->base->name, lib->version);
 					return true;
 				}
 			}
@@ -300,23 +304,24 @@ static bool elfread(lib_t * lib) {
 							.fd = -1,
 							.flags = ((phdr->p_flags & PF_R) ? PROT_READ : 0) | ((phdr->p_flags & PF_W) ? PROT_WRITE : 0) | ((phdr->p_flags & PF_X) ? PROT_EXEC : 0),
 							.addr = phdr->p_vaddr - addr_delta,
-							.size = phdr->p_memsz,
-							.align = phdr->p_align
+							.size = phdr->p_memsz
 						};
 					}
 				}
 
-				for (size_t i = 0; i < shmem_num; i++) {
-					if (!map_sharedmem(lib, shmem + i))
-						success = false;
-				}
-				if (lib->version == 0 && shmem_num > 0) {
-					if ((lib->base->sharedmem = malloc(sizeof(sharedmem_t) * shmem_num)) == NULL) {
-						ERR("Unable to allocate memory for %zu shared memory entries - aborting.", shmem_num);
-						abort();
+				if (shmem_num > 0) {
+					DBG("Creating shared memory for %s...", lib->realpath);
+					for (size_t i = 0; i < shmem_num; i++)
+						if (!map_sharedmem(lib, shmem + i))
+							success = false;
+					if (lib->version == 0) {
+						if ((lib->base->sharedmem = malloc(sizeof(sharedmem_t) * shmem_num)) == NULL) {
+							ERR("Unable to allocate memory for %zu shared memory entries - aborting.", shmem_num);
+							abort();
+						}
+						memcpy(lib->base->sharedmem, shmem, sizeof(sharedmem_t) * shmem_num);
+						lib->base->sharedmemsz = shmem_num;
 					}
-					memcpy(lib->base->sharedmem, shmem, sizeof(sharedmem_t) * shmem_num);
-					lib->base->sharedmemsz = shmem_num;
 				}
 				assert(lib->base->sharedmemsz == 0 || lib->base->sharedmem != NULL);
 			}
@@ -342,8 +347,8 @@ static bool elfread(lib_t * lib) {
 						LOG("Non-continous global offset tables in %s: %s", lib->realpath, section_name);
 					}
 				}
-				
 			}
+			DBG("GOT of %s v%u at %p + %p (%zu bytes)", lib->base->name, lib->version, lib->addr, lib->got, lib->gotsz);
 		}
 		elf_end(elf);
 	}
@@ -352,8 +357,9 @@ static bool elfread(lib_t * lib) {
 	// For RELRO, ensure GOT is writable
 	uintptr_t addr = lib->addr + lib->got & (~(pagesize-1));
 	size_t len = lib->addr + lib->got + lib->gotsz - addr;
+	DBG("Make %p (%zu bytes) in %s v%u writable", (void*) addr, len, lib->base->name, lib->version);
 	if (mprotect((void*)addr, len, PROT_READ | PROT_WRITE) != 0)
-		LOG("(Un)protecting %lx (%zu bytes) in %s v%u failed: %m", lib->addr + addr, len, lib->base->name, lib->version);
+		LOG("(Un)protecting %p (%zu bytes) in %s v%u failed: %m", (void*) addr, len, lib->base->name, lib->version);
 
 	return success;
 }
@@ -411,7 +417,7 @@ static int memfddup(const char * name, int src_fd, ssize_t len) {
 		while (true) {
 			errno = 0;
 			ssize_t s = sendfile(mem_fd, src_fd, NULL, len);
-			if (s == -1) {
+			if (s < 0) {
 				DBG("Copying %s file failed: %m", name);
 				break;
 			} else if ((len -= s) <= 0) {
@@ -666,7 +672,7 @@ static void fork_child(void) {
 				assert(shmem[j].flags == identity[i].sharedmem[j].flags);
 
 				for (lib_t * l = identity[i].current; l != NULL; l = l->prev) {
-					size_t offset = shmem->addr % shmem->align;
+					size_t offset = shmem->addr % pagesize;
 					uintptr_t mem_page_addr = shmem->addr + l->addr - offset;
 					size_t mem_page_size = shmem->size + offset;
 					errno = 0;
@@ -693,7 +699,7 @@ static void fork_child(void) {
 }
 
 
-static bool enable() {
+static bool enable_update() {
 	// Logging
 	logstart = time(NULL);
 	const char * level = getenv("LIVE_LOGLEVEL");
@@ -704,6 +710,8 @@ static bool enable() {
 	pagesize = sysconf(_SC_PAGE_SIZE);
 	if (pagesize == -1)
 		WARN("Unable to get page size: %m");
+	else
+		DBG("Page size is %x", pagesize);
 
 	// Load main program
 	lib_t * main = dlload(NULL);
@@ -740,7 +748,7 @@ static bool enable() {
 			identity[i].current = main;
 			char tmp[PATH_MAX + 1] = { '\0' };
 			identity[i].path = strndup(readlink("/proc/self/exe", tmp, PATH_MAX) < 0 ? "/proc/self/exe" : tmp, PATH_MAX);
-			DBG("Me is %s", identity[i].path);
+			DBG("Program path is %s", identity[i].path);
 		} else if (ignore_lib(l->l_name)) {
 			DBG("Skipping shared library %s", l->l_name);
 			continue;
@@ -762,6 +770,8 @@ static bool enable() {
 		identity[i].current->addr = l->l_addr;
 		identity[i].current->version = 0;
 		identity[i].current->base = identity + i;
+
+		DBG("Loaded %s (%x) at %p", identity[i].name, identity[i].current->checksum, identity[i].current->addr);
 
 		// Put in hash map
 		ENTRY *r;
@@ -792,7 +802,7 @@ static bool enable() {
 }
 
 
-static bool disable() {
+static bool disable_update() {
 	DBG("Stopping watcher thread of %lu", (long unsigned)getpid());
 	thread_watcher_remove();
 	return true;
@@ -804,26 +814,32 @@ static bool disable() {
 static int (*real_main)(int, char **, char **);
 
 int main_wrapper(int argc, char **argv, char **envp) {
-	enable();
+	enable_update();
 	int r = real_main(argc, argv, envp);
-	disable();
+	disable_update();
 	return r;
 }
 
 int __libc_start_main(int (*main) (int, char **, char **), int argc, char ** argv, void (*init) (void), void (*fini) (void), void (*rtld_fini) (void), void (* stack_end)) {
 	real_main = main;
-	typeof(&__libc_start_main) real_libc_start_main = dlsym(RTLD_NEXT, "__libc_start_main");
+	const char * libc_start_main = "__libc_start_main";
+	dlerror();
+	typeof(&__libc_start_main) real_libc_start_main = dlsym(RTLD_NEXT, libc_start_main);
+	if (real_libc_start_main == NULL) {
+		ERR("%s not found: %s - abort!", libc_start_main, dlerror());
+		abort();
+	}
 	return real_libc_start_main(main_wrapper, argc, argv, init, fini, rtld_fini, stack_end);
 }
 
 #else
 
-static __attribute__((constructor)) bool init() {
-	return enable();
+static __attribute__((constructor)) void init() {
+	enable_update();
 }
 
-static __attribute__((destructor)) bool fini() {
-	return disable;
+static __attribute__((destructor)) void fini() {
+	disable_update();
 }
 
 #endif
