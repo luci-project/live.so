@@ -5,7 +5,7 @@ DIR := $(dir $(abspath $(firstword $(MAKEFILE_LIST))))
 LIBNAME := fib
 
 # optimization level
-OPTLEVEL ?= 2
+OPTLEVEL ?= 1
 # C Flags, can be customized as desired...
 CFLAGS ?= -O$(OPTLEVEL) -gdwarf-4 -Wall -DDELAY=1
 # ... only -fPIC (for position independent code) is required for shared library
